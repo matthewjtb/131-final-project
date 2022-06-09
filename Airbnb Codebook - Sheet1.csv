@@ -1,0 +1,13 @@
+Variable Name,Type,Description,Example
+id,numeric,Airbnb's identification number for the listing,"""2595"""
+name,character,The listing's name given by the host,"""Skylit Midtown Castle"""
+neighbourhood_cleansed,character,The name of the neighbourhood group Airbnb has identified the listing is located in,"""Midtown"""
+neighbourhood_group_cleansed,character,"The name of the broader neighbourhood Airbnb has identified the lisitng is located in. Note that in this dataset, these are the boroughs of NYC.","""Manhattan"""
+room_type,character,The size/space of the listing. ,"""Entire home/apt"", ""Private room"", ""Hotel room"", ""Shared room"""
+accommodates,numeric,The number of people the listing can accommodate,2
+bathrooms,numeric,The number of bathrooms in the listing.,1.5
+bedrooms,numeric,The number of bedrooms in the listing.,1
+beds,numeric,The number of beds in the listing.,2
+price,numeric,The price per night of renting the listing.,150
+minimum_nights,numeric,The minimum number of nights the listing must be booked for.,30
+number_of_reviews,numeric,The number of reviews for this listing that have been posted on Airbnb's website.,48

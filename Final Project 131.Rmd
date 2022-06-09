@@ -1,0 +1,511 @@
+---
+title: "Final Project PSTAT131"
+author: "Matthew Brennan"
+date: '2022-05-23'
+output: html_document
+toc: true
+toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+As AirBNB rose to prominence in the early 2010s, it became a very popular alternative to booking hotels. But, with a vast array of options in each city and large price ranges, the question arises: how much should I really be paying? I decided that I wanted to attempt to build a predictive model for the price of AirBNBs to see how accurately a model could predict a listing's price based on publicly available data provided by AirBNB. I chose to focus my model on listings in New York City, where I figured I would have a large dataset to work with and avoid drastic regional differences by including other cities/states.\
+
+I believe this model could be useful for two reasons: \
+1. People who are looking to post a listing on Airbnb could enter information about their listing to estimate a reasonable price to post.\
+2. People who are looking to book a listing could enter information about a listing they are interested in to see if it is reasonably priced compared to other similar listings.\
+
+## Loading Packages
+
+```{r, include = FALSE}
+library(ggplot2)
+library(tidyverse)
+library(tidymodels)
+library(corrr)
+library(corrplot)
+library(vip)
+library(janitor)
+library(hardhat)
+library(kknn)
+library(kernlab)
+tidymodels_prefer()
+set.seed(11)
+```
+
+## Loading Data
+
+This data is publicly provided by Airbnb at http://insideairbnb.com/get-the-data/ . 
+
+```{r}
+full_data <- read.csv("data/listings_full.csv")
+
+```
+
+# Data Cleaning
+
+First, we'll select the variables that I believe could be useful for our model. Descriptions of these variables can be found in the codebook.
+
+```{r}
+selected_variables <- c("id", "name", "neighbourhood_cleansed", "neighbourhood_group_cleansed", "room_type",
+                        "accommodates", "bathrooms", "bathrooms_text", "bedrooms", "beds", "amenities", "price",
+                        "minimum_nights", "number_of_reviews")
+
+data1 <- full_data[, selected_variables]
+```
+
+I've noticed that the bathrooms is null for all observations, but almost all observations have a bathrooms_text variable that has the number of bathrooms in character format. First, let's remove observations with a empty bathrooms_text variable.
+
+```{r}
+data2 <- data1[data1$bathrooms_text != "",]
+
+row.names(data2) <- NULL # reset index
+```
+
+Now we can extract the numeric value for bathrooms from bathrooms_text. Additionally, all observations that were missing a numeric value in bathrooms_text were listed as "half-bath", so these will all be assigned 0.5 for bathrooms.
+
+```{r}
+bathroom_numbers <- regmatches(data2$bathrooms_text, gregexpr("[[:digit:]]+\\.*[[:digit:]]*", data2$bathrooms_text))
+
+bathroom_numbers <- lapply(bathroom_numbers, function(x) if(identical(x, character(0))) '0.5' else x)
+
+data3 <- data2
+data3$bathrooms <- as.numeric(unlist(bathroom_numbers))
+```
+
+We can drop the bathrooms_text variable now.
+
+```{r}
+data4 <- subset(data3, select = -c(bathrooms_text))
+
+```
+
+Next, we need to change price from a character variable to a numeric one.
+
+```{r}
+data5 <- data4
+data5$price = as.numeric(gsub("[$,]", "", data5$price))
+```
+
+Lastly, let's only use listings with at least 2 reviews, to exclude new listings or avoid listings that no one has booked.
+
+```{r}
+final_data <- data5[data5$number_of_reviews > 1,]
+
+```
+
+
+# Exploratory Data Analysis
+
+One thing I've come to realize is that the variables accommodates, bedrooms, and beds might be correlated since they all deal with the number of people that can fit at the property. To check this, I've created a correlation plot for these variables
+
+```{r}
+final_data %>% 
+  select(accommodates, bedrooms, beds) %>% 
+  cor(use = "complete.obs") %>% 
+  corrplot(type = "lower", diag = FALSE)
+
+```
+
+These variables are extremely positively correlated. Because of this, I've decided only to use the accommodates variable for my model since beds and bedrooms have missing values.\
+
+Next, I'd like to look at the neighbourhood_cleansed variable.
+
+```{r}
+ggplot(final_data) + geom_histogram(aes(x = neighbourhood_cleansed), stat = 'count')
+
+```
+There are definitely way too many neighbourhoods with too few observations for this variable to be useful in regression. Let's look at the neighbourhood_group_cleansed variable, which sorts them into boroughs, instead.
+
+```{r}
+ggplot(final_data) + geom_histogram(aes(x = neighbourhood_group_cleansed), stat = 'count')
+
+```
+This is certainly an improvement on the neighbourhood_cleansed variable, so we'll used these boroughs for our model instead.\
+
+Let's take a look at the relationship between borough and price.
+
+```{r}
+ggplot(final_data) + geom_boxplot(aes(x = price, y = neighbourhood_group_cleansed)) + 
+  scale_x_log10() +
+  xlab("Price (Log Scale)") +
+  ylab("Borough")
+
+```
+
+Manhattan appears to have a higher median price than the other boroughs, as well as more outliers on the pricier side.\
+
+Let's now look at accommodates against price.
+
+```{r}
+ggplot(final_data) + geom_point(aes(x = accommodates, y = price)) +
+  scale_y_log10() +
+  xlab("Accommodates") + 
+  ylab("Price (Log Scale)")
+
+```
+
+There appears to be a trend that as accommodates increases, the mean price gets higher.\ 
+
+# Model Building
+
+## Data Splitting
+
+First we'll turn our categorical variables to factors.
+
+```{r}
+final_data$neighbourhood_group_cleansed <- as.factor(final_data$neighbourhood_group_cleansed)
+final_data$room_type <- as.factor(final_data$room_type)
+
+```
+
+Next we split our data into training and testing sets, with 80% of the data in the training set and 20% in the testing set.
+
+```{r}
+set.seed(11)
+final_data_split <- initial_split(final_data, prop = 0.8)
+final_data_training <- training(final_data_split)
+final_data_testing <- testing(final_data_split)
+
+```
+
+Now, we create our recipe.
+
+```{r}
+final_recipe <- recipe(price ~ neighbourhood_group_cleansed + room_type + accommodates + 
+                         bathrooms + minimum_nights, data = final_data) %>% 
+  step_center(accommodates, bathrooms, minimum_nights) %>% 
+  step_scale(accommodates, bathrooms, minimum_nights)
+
+```
+
+Here, we'll fold the data into 10 folds.
+
+```{r}
+train_folds <- vfold_cv(final_data_training, v = 10)
+
+```
+
+I decided to try building the following models:\
+- Linear Regression\
+- Random Forest\
+- Nearest Neighbors\
+- Support Vector Machines\
+- Boosted Tree\
+
+## Linear Regression
+
+First, a basic linear regression for price.
+```{r}
+lm_model <- linear_reg() %>% 
+  set_engine("lm")
+
+lm_wflow <- workflow() %>% 
+  add_model(lm_model) %>% 
+  add_recipe(final_recipe)
+
+lm_fit <- fit(lm_wflow, final_data_training)
+
+lm_fit %>% 
+  extract_fit_parsnip() %>% 
+  tidy()
+
+rmse(predict(lm_fit, new_data = final_data_training) %>% 
+                            bind_cols(final_data_training),
+     truth = price,
+     estimate = .pred)
+
+```
+
+As an example, I fit the linear regression model to the testing data. Note the axes in the graph are log scale.
+
+```{r}
+
+lm_results <- predict(lm_fit, new_data = final_data_testing) %>% 
+                            bind_cols(final_data_testing)
+
+rmse(lm_results,
+     truth = price,
+     estimate = .pred)
+
+ggplot(data = lm_results,
+       mapping = aes(x = .pred, y = price)) +
+  scale_x_log10(limits = c(1, 10000)) + 
+  scale_y_log10(limits = c(1, 10000)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = 'red') +
+  labs(title = 'Linear Regression Fit on Testing Data',
+       x = 'Predicted Price',
+       y = 'Actual Price')
+
+```
+
+## Random Forest
+
+Next, I fit a Random Forest model. I tuned the number of variables to randomly sample, the number of trees, and the minimum number of data points at a node for the model to split it further. I used the ranger engine.
+
+```{r}
+rand_forest_spec <- rand_forest() %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+rand_forest_wf <- workflow() %>%
+  add_model(rand_forest_spec %>% set_args(mtry = tune(),
+                            trees = tune(),
+                            min_n = tune())) %>%
+  add_recipe(final_recipe)
+
+rand_forest_param_grid <- grid_regular(mtry(range = c(1, 4)), 
+                                            trees(range = c(64, 128)),
+                                            min_n(range = c(100, 10000)), levels = 8)
+
+tune_res_rand_forest <- tune_grid(
+  rand_forest_wf, 
+  resamples = train_folds, 
+  grid = rand_forest_param_grid, 
+  metrics = metric_set(rmse)
+)
+
+autoplot(tune_res_rand_forest)
+
+show_best(tune_res_rand_forest)
+
+```
+
+## K-Nearest Neighbors
+
+Next, I fit a k-nearest neighbors model. I tuned the number of neighbors to use. I used the kknn engine.
+
+```{r}
+nn_model <- 
+  nearest_neighbor(
+    neighbors = tune(),
+    mode = "regression") %>% 
+  set_engine("kknn")
+
+nn_workflow <- workflow() %>% 
+  add_model(nn_model) %>% 
+  add_recipe(final_recipe)
+
+nn_params <- extract_parameter_set_dials(nn_model)
+
+nn_grid <- grid_regular(nn_params, levels = 10)
+
+tune_res_nn <- nn_workflow %>% 
+  tune_grid(
+    resamples = train_folds, 
+    grid = nn_grid,
+    metrics = metric_set(rmse))
+
+autoplot(tune_res_nn)
+
+show_best(tune_res_nn)
+```
+
+## Support Vector Machines
+
+Next I used support vector machines. I tuned the cost parameter and used the kernlab engine.
+
+```{r}
+svm_rbf_spec <- svm_rbf() %>%
+  set_mode("regression") %>%
+  set_engine("kernlab")
+
+svm_rbf_wflow <- workflow() %>%
+  add_model(svm_rbf_spec %>% set_args(cost = tune())) %>%
+  add_recipe(final_recipe)
+
+param_grid_svm <- grid_regular(cost(), levels = 10)
+
+tune_res_svm <- tune_grid(
+  svm_rbf_wflow, 
+  resamples = train_folds, 
+  grid = param_grid_svm,
+  metrics = metric_set(rmse)
+)
+
+autoplot(tune_res_svm)
+
+show_best(tune_res_svm)
+
+```
+
+## Boosted Trees
+
+Lastly, I fit a boosted trees model. I ran into unexpected issues here, because I discovered that the xgboost engine was not able to work with factor variables. To fix this, I first created a new dataset and one hot encoded the neighbourhood_group_cleansed and room_type variables.
+
+```{r}
+
+# make numeric vars for xgboost
+final_data_xgboost <- final_data %>% 
+  mutate(n = 1) %>% 
+  distinct %>% 
+  pivot_wider(id_cols = c(id, name, room_type, accommodates, bathrooms, minimum_nights, price),
+              names_from = neighbourhood_group_cleansed,
+              values_from = n) %>% 
+  mutate_at(vars(matches("Bronx|Brooklyn|Manhattan|Queens|Staten Island")), replace_na, 0)
+
+names(final_data_xgboost) <- make.names(names(final_data_xgboost))
+
+# make numeric vars for room_type
+final_data_xgboost <- final_data_xgboost %>% 
+  mutate(n = 1) %>% 
+  distinct %>% 
+  pivot_wider(id_cols = c(id, name, Bronx, Brooklyn, Manhattan, Queens, Staten.Island, accommodates, bathrooms, minimum_nights, price),
+              names_from = room_type,
+              values_from = n) %>% 
+  mutate_at(vars(matches("Entire home/apt|Private room| Hotel room| Shared room")), replace_na, 0)
+
+names(final_data_xgboost) <- make.names(names(final_data_xgboost))
+
+```
+
+Then, I had to create a new recipe with this dataset and new data splits and folds.
+
+```{r}
+# recipe for xgboost
+
+final_recipe_xgboost <- recipe(price ~ Bronx + Brooklyn + Manhattan + Queens + Staten.Island + Entire.home.apt + Private.room + Hotel.room + Shared.room + accommodates +
+                         bathrooms + minimum_nights, data = final_data_xgboost) %>% 
+  step_center(accommodates, bathrooms, minimum_nights) %>% 
+  step_scale(accommodates, bathrooms, minimum_nights)
+
+# data split for xgboost
+
+final_data_xgboost_split <- initial_split(final_data_xgboost, prop = 0.8)
+final_data_xgboost_training <- training(final_data_xgboost_split)
+final_data_xgboost_testing <- testing(final_data_xgboost_split)
+
+# folds for xgboost
+train_folds_xgboost <- vfold_cv(final_data_xgboost_training, v = 10)
+
+```
+
+Finally, I fit the boosted trees model. I tuend the the number of variables to randomly sample, the minimum number of data points at a node for the model to split it further, and the learn rate. I used the xgboost engine.
+
+```{r}
+
+boost_model <- boost_tree(mode = "regression",
+                       min_n = tune(),
+                       mtry = tune(),
+                       learn_rate = tune()) %>% 
+  set_engine("xgboost")
+
+boost_wf <- workflow() %>% 
+  add_model(boost_model) %>% 
+  add_recipe(final_recipe_xgboost)
+
+boost_params <- parameters(boost_model) %>% 
+  update(mtry = mtry(range= c(2, 4)),
+         learn_rate = learn_rate(range = c(-5, 0.2))
+  )
+
+# define grid
+boost_param_grid <- grid_regular(boost_params, levels = 10)
+
+tune_res_boost <- tune_grid(
+  boost_wf, 
+  resamples = train_folds_xgboost, 
+  grid = boost_param_grid, 
+  metrics = metric_set(rmse)
+)
+
+autoplot(tune_res_boost)
+
+show_best(tune_res_boost)
+
+
+```
+
+# Final Model
+
+Since the random forest model has the lowest RMSE, we'll use it and apply it to our testing data.
+
+```{r}
+best_params_rand_forest <- select_best(tune_res_rand_forest)
+
+rand_forest_final <- finalize_workflow(rand_forest_wf, best_params_rand_forest)
+
+rand_forest_final_fit <- fit(rand_forest_final, final_data_training)
+
+rand_forest_results <- predict(rand_forest_final_fit, new_data = final_data_testing) %>% 
+                            bind_cols(final_data_testing)
+
+rmse(rand_forest_results,
+     truth = price,
+     estimate = .pred)
+
+```
+
+The RMSE increased from 216 when using the training data to 239 when using the testing data. There was likely a decent amount of overfitting from the training set. I created a graph to visualize the model's predictions against the actual prices. Note that the axes are in log scale.
+
+```{r}
+ggplot(data = rand_forest_results,
+       mapping = aes(x = .pred, y = price)) +
+  scale_x_log10(limits = c(1, 10000)) + 
+  scale_y_log10(limits = c(1, 10000)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = 'red') +
+  labs(title = 'Random Forest Fit on Testing Data',
+       x = 'Predicted Price',
+       y = 'Actual Price')
+
+
+```
+
+I created some facet plots to see if certain variables made predictions more difficult.
+
+```{r}
+ggplot(data = rand_forest_results,
+       mapping = aes(x = .pred, y = price)) +
+  scale_x_log10(limits = c(1, 10000)) + 
+  scale_y_log10(limits = c(1, 10000)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = 'red') +
+  labs(title = 'Random Forest Fit on Testing Data by Room Type',
+       x = 'Predicted Price',
+       y = 'Actual Price') + 
+  facet_wrap(~room_type)
+
+ggplot(data = rand_forest_results,
+       mapping = aes(x = .pred, y = price)) +
+  scale_x_log10(limits = c(1, 10000)) + 
+  scale_y_log10(limits = c(1, 10000)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = 'red') +
+  labs(title = 'Random Forest Fit on Testing Data by Borough',
+       x = 'Predicted Price',
+       y = 'Actual Price') + 
+  facet_wrap(~neighbourhood_group_cleansed)
+
+ggplot(data = rand_forest_results,
+       mapping = aes(x = .pred, y = price)) +
+  scale_x_log10(limits = c(1, 10000)) + 
+  scale_y_log10(limits = c(1, 10000)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = 'red') +
+  labs(title = 'Random Forest Fit on Testing Data by Accommodates',
+       x = 'Predicted Price',
+       y = 'Actual Price') + 
+  facet_wrap(~accommodates)
+
+```
+
+No single varible stands out as an issue, but it appears that listings that accommodate fewer people tend to be more abundant and more difficult to predict with precision.
+
+# Conclusion
+
+Though my attempt to build a prediction model for AirBNB prices in New York had some success, ultimately it was not nearly as accurate as I was hoping. With a RMSE on my final model of $239, I don't believe this would be an accurate enough model for people looking to utilize it to put a price on their listing. It could possible still be useful for the model to be used to analyze if a listing is noticeably overpriced or a steal before booking it.\
+
+I think what would have made my model more accurate is information about the buildings themselves. While my dataset had information about the size of the listings (how many people it could accommodate, the number of bathrooms), it lacked information about the quality of the building/space itself (year built, type of architecture, etc.) One observation of note is that listings that accommodated 2-4 people appeared to have more error in the prediction model. It's likely that these listings, while similar in size, vary largely in quality and age of the space provided. I think that some of these types of qualities would have been explained by the more detailed neighbourhood variable, assuming buildings in the same neighbourhood are similar in structure and age, but ultimately there were too many neighbourhoods and would have caused overfitting in this type of model.\
+
+If I were to revisit this project, I would perhaps see if it was possible to analyze data about each neighbourhood and group them into factors based on average economic status, then use this factor variable in my prediction model. Another strategy would be to build different predictive models for each borough, so there are less neighbourhoods in each.\
+
+In the future, I'd like to see if this type of model can be utilized for other cities that AirBNB services. I think New York City may be an outlier due to the large population and borough structure, but I believe this type of prediction might be possible for other large metropolitan centers.\
+
+Overall, I enjoyed working with the AirBNB dataset to see how these listings get priced, and I am somewhat satisfied with my model's ability to predict a rough estimate of a listing's price in New York City.\
+
+
